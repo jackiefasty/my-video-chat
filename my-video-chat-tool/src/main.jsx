@@ -58,7 +58,7 @@ let remoteStream = null; // The remote webcam
 
 // We use imperative DOM APIs
 const webcamButton = document.getElementById('webcamButton');
-const webcamVideoStream= document.getElementById('webcamVideoStream');
+const webcamVideoStream = document.getElementById('webcamVideoStream');
 const callButton = document.getElementById('callButton');
 const callInput = document.getElementById('callInput');
 const answerButton = document.getElementById('answerButton');
@@ -67,7 +67,7 @@ const hangupButton = document.getElementById('hangupButton');
 
 // 1. Set up the media source for the local webcam (event handler for the click event on the webcam button)
 webcamButton.onclick = async () => {
-  localStream = await navigator.mediaDevices.getUserMedia({ video: true , audio: true});
+  localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
   remoteStream = new MediaStream()
 
   // Push tracks from local stream user to peer connection
@@ -83,19 +83,19 @@ webcamButton.onclick = async () => {
   }
 
   webcamVideoStream.srcObject = localStream;
-  remoteVideoStream.srcObject - remoteStream;
+  remoteVideoStream.srcObject = remoteStream;
 };
 
 // 2. Create an offer (The user who starts the call is the one who makes an offer)
 callButton.onclick = async () => {
   const callDoc = firestore.collection('calls').doc();
   const offerCandidates = callDoc.collection('offerCandidates');
-  const answerCandidates =callDoc.collection('answerCandidates');
+  const answerCandidates = callDoc.collection('answerCandidates');
 
   callInput.value = callDoc.id;
 
   // Get candidates for caller, save to db
-  pc.onicecandiate = event => {
+  pc.onicecandidate = event => {
     event.candidate && offerCandidates.add(event.candidate.toJSON());
   };
 
@@ -131,45 +131,47 @@ callButton.onclick = async () => {
       }
     });
   });
+};
 
-  // 3. Create an answer, i.e. anser the call, with a unique ID
-  answerButton.onclick = async () => {
-    const callId = callInput.value;
-    const callDoc = firestore.collection('calls').doc(callId);
-    const answerCandidates = callDoc.collection('answerCandidates');
+// 3. Create an answer, i.e. anser the call, with a unique ID
+answerButton.onclick = async () => {
+  const callId = callInput.value;
+  const callDoc = firestore.collection('calls').doc(callId);
+  const offerCandidates = callDoc.collection('offerCandidates');
+  const answerCandidates = callDoc.collection('answerCandidates');
 
-    // Listen to ICE candidate on the peer connection to udpate the anser candidates collection
-    // when a new candidate is generated
-    pc.onicecandidate = event => {
-      event.candidate && answerCandidates.add(event.candidate.toJSON());
-    };
+  // Listen to ICE candidate on the peer connection to udpate the anser candidates collection
+  // when a new candidate is generated
+  pc.onicecandidate = event => {
+    event.candidate && answerCandidates.add(event.candidate.toJSON());
+  };
 
-    // Fetch call document from the database, and grab its data
-    const callData = (await callDoc.get()).data();
+  // Fetch call document from the database, and grab its data
+  const callData = (await callDoc.get()).data();
 
-    const offerDescription = callData.offer;
-    await pc.setRemoteDescription(new RTCSessionDescription(offerDescription)); // Set remote description on the peer connection
+  const offerDescription = callData.offer;
+  await pc.setRemoteDescription(new RTCSessionDescription(offerDescription)); // Set remote description on the peer connection
 
-    // Create an answer from the peer connection and set the current local description
-    const answerDescription = await pc.createAnswer();
-    await pc.setLocalDescription(answerDescription);
+  // Create an answer from the peer connection and set the current local description
+  const answerDescription = await pc.createAnswer();
+  await pc.setLocalDescription(answerDescription);
 
-    // Convert the Session Description Protocol (SDP) data info to a plain JS object
-    const answer = {
-      sdp: answerDescription.sdp,
-      type: answerDescription.type,
-    };
+  // Convert the Session Description Protocol (SDP) data info to a plain JS object
+  const answer = {
+    sdp: answerDescription.sdp,
+    type: answerDescription.type,
+  };
 
-    // Update on the call document so that the other user can listen to the answer
-    await callDoc.update({answer});
+  // Update on the call document so that the other user can listen to the answer
+  await callDoc.update({ answer });
 
-    // Set up a listener on the offer candidates collection
-    offerCandidates.onSnapshot((snapshot) => {
-      snapshot.docChanges().forEach((change) => {
-        if (change.type === 'added') {
-          let data = change.doc.data();
-          pc.addIceCandidate(new RTCIceCandidate(data));
-        }
-      });
+  // Set up a listener on the offer candidates collection
+  offerCandidates.onSnapshot((snapshot) => {
+    snapshot.docChanges().forEach((change) => {
+      if (change.type === 'added') {
+        let data = change.doc.data();
+        pc.addIceCandidate(new RTCIceCandidate(data));
+      }
     });
+  });
 };
