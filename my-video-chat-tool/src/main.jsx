@@ -63,6 +63,10 @@ const servers = {
 // Global State: values toc share between multiple components
 let pc = new RTCPeerConnection(servers);
 console.debug('[pc] created with servers', servers);
+// Snapshot unsubscribe handles so we can detach listeners when hangup
+let callDocUnsub = null;
+let offerCandidatesUnsub = null;
+let answerCandidatesUnsub = null;
 
 // Ensure stable transceivers (audio + video) so subsequent offers keep the same m-line order.
 function ensureTransceivers() {
@@ -84,9 +88,46 @@ function ensureTransceivers() {
 
 ensureTransceivers();
 
+// Ensure local media is started and tracks are attached to the PeerConnection
+async function ensureLocalStream() {
+  if (localStream) return localStream;
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    // attach tracks to existing transceivers or addTrack
+    try {
+      const audioTrack = localStream.getAudioTracks()[0];
+      const videoTrack = localStream.getVideoTracks()[0];
+      if (window._localTransceivers && window._localTransceivers.audio && audioTrack) {
+        window._localTransceivers.audio.sender.replaceTrack(audioTrack);
+        console.debug('[pc] replaced audio track on transceiver (ensureLocalStream)');
+      } else if (audioTrack) {
+        pc.addTrack(audioTrack, localStream);
+      }
+      if (window._localTransceivers && window._localTransceivers.video && videoTrack) {
+        window._localTransceivers.video.sender.replaceTrack(videoTrack);
+        console.debug('[pc] replaced video track on transceiver (ensureLocalStream)');
+      } else if (videoTrack) {
+        pc.addTrack(videoTrack, localStream);
+      }
+    } catch (e) {
+      console.warn('[pc] ensureLocalStream add/replaceTrack failed', e);
+      localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+    }
+    if (webcamVideoStream) webcamVideoStream.srcObject = localStream;
+    return localStream;
+  } catch (e) {
+    console.error('[ui] getUserMedia failed in ensureLocalStream', e);
+    throw e;
+  }
+}
+
 // Pending candidate buffer & remote description flag
 let pendingCandidates = [];
 let remoteDescriptionSet = false;
+// Signaling state for current call and renegotiation
+let currentCallDoc = null;
+let currentRole = null; // 'caller' | 'answerer'
+let lastLocalOfferSdp = null; // used to avoid responding to our own offer
 
 function bufferCandidate(candidate) {
   pendingCandidates.push(candidate);
@@ -99,10 +140,10 @@ async function flushPendingCandidates() {
   pendingCandidates = [];
   for (const c of toFlush) {
     try {
-      await pc.addIceCandidate(c);
-      console.debug('[signaling] flushed candidate', c);
+  await pc.addIceCandidate(c);
+  console.debug('[signaling] flushed candidate', c.sdpMid, c.sdpMLineIndex);
     } catch (e) {
-      console.error('[signaling] failed to flush candidate', e, c);
+  console.error('[signaling] failed to flush candidate', e, c);
     }
   }
 }
@@ -112,17 +153,54 @@ pc.onicecandidate = (event) => {
   console.debug('[pc] onicecandidate', event.candidate);
 };
 
+pc.onnegotiationneeded = async () => {
+  console.debug('[pc] negotiationneeded');
+  if (!currentCallDoc) {
+    console.debug('[pc] no currentCallDoc, skipping renegotiation');
+    return;
+  }
+  try {
+    const offerDescription = await pc.createOffer();
+    await pc.setLocalDescription(offerDescription);
+    const offer = { sdp: offerDescription.sdp, type: offerDescription.type };
+    // Avoid writing the same SDP twice
+    if (offer.sdp !== lastLocalOfferSdp) {
+      await currentCallDoc.update({ offer });
+      lastLocalOfferSdp = offer.sdp;
+      console.debug('[pc] published renegotiation offer');
+    }
+  } catch (e) {
+    console.error('[pc] renegotiation failed', e);
+  }
+};
+
 pc.ontrack = (event) => {
   console.debug('[pc] ontrack', event);
-  if (!remoteStream) {
-    remoteStream = new MediaStream();
-  }
+  // Prefer assigning the remote stream delivered by the ontrack event when available.
   if (event.streams && event.streams[0]) {
-    event.streams[0].getTracks().forEach((t) => remoteStream.addTrack(t));
-  } else if (event.track) {
+    console.debug('[pc] ontrack: using event.streams[0]');
+    remoteStream = event.streams[0];
+  const statusEl = document.getElementById('status'); if (statusEl) statusEl.textContent = 'Remote stream received';
+    if (remoteVideoStream) {
+      remoteVideoStream.srcObject = remoteStream;
+      // Try to play; browsers may block autoplay with sound
+      remoteVideoStream.play().catch((err) => {
+        console.warn('[ui] remoteVideo.play blocked', err);
+        const s = document.getElementById('status'); if (s) s.textContent = 'Remote stream received — click video to play (autoplay blocked)';
+        try { remoteVideoStream.addEventListener('click', () => remoteVideoStream.play().catch(()=>{}), { once: true }); } catch (e) {}
+      });
+    }
+    return;
+  }
+
+  // Fallback: accumulate tracks into a MediaStream
+  if (!remoteStream) remoteStream = new MediaStream();
+  if (event.track) {
+    console.debug('[pc] ontrack: adding single track', event.track.kind);
     remoteStream.addTrack(event.track);
   }
   if (remoteVideoStream) remoteVideoStream.srcObject = remoteStream;
+  try { if (remoteVideoStream) remoteVideoStream.play().catch(()=>{}); } catch (e) {}
 };
 
 pc.onconnectionstatechange = () => console.debug('[pc] connectionState:', pc.connectionState);
@@ -132,6 +210,9 @@ let remoteStream = null; // The remote webcam
 
 // We use imperative DOM APIs — attach handlers after DOM is ready to ensure elements exist
 let webcamButton, webcamVideoStream, callButton, callInput, answerButton, remoteVideoStream, hangupButton;
+
+// In-page debug panel element
+let debugPanel = null;
 
 window.firebase = firebase;
 window.firestore = firestore;
@@ -147,11 +228,40 @@ window.addEventListener('DOMContentLoaded', () => {
   remoteVideoStream = document.getElementById('remoteVideoStream');
   hangupButton = document.getElementById('hangupButton');
 
+  // If streams already exist (e.g., on reconnection), attach them to the elements
+  if (webcamVideoStream && localStream) webcamVideoStream.srcObject = localStream;
+  if (remoteVideoStream && remoteStream) remoteVideoStream.srcObject = remoteStream;
+
+  // Create a lightweight debug panel for quick visibility
+  debugPanel = document.getElementById('debug-panel');
+  if (!debugPanel) {
+    debugPanel = document.createElement('div');
+    debugPanel.id = 'debug-panel';
+    debugPanel.style = 'position:fixed; right:12px; bottom:12px; background:#fff; color:#111; padding:8px; border-radius:6px; box-shadow:0 1px 4px rgba(0,0,0,0.12); font-size:12px; max-width:320px; z-index:9999;';
+    document.body.appendChild(debugPanel);
+  }
+
+  // Update debug panel periodically
+  setInterval(() => {
+    const lines = [];
+    lines.push('callId: ' + (currentCallDoc ? (currentCallDoc.id || '[doc]') : 'none'));
+    lines.push('role: ' + (currentRole || 'none'));
+    lines.push('pc.connectionState: ' + (pc && pc.connectionState));
+    lines.push('pc.iceConnectionState: ' + (pc && pc.iceConnectionState));
+    lines.push('remoteDescriptionSet: ' + !!remoteDescriptionSet);
+    lines.push('pendingCandidates: ' + (pendingCandidates && pendingCandidates.length));
+    lines.push('offerCandidatesUnsub: ' + (offerCandidatesUnsub ? 'yes' : 'no'));
+    lines.push('answerCandidatesUnsub: ' + (answerCandidatesUnsub ? 'yes' : 'no'));
+    lines.push('localTracks: ' + (localStream ? localStream.getTracks().length : 0));
+    lines.push('remoteTracks: ' + (remoteStream ? remoteStream.getTracks().length : 0));
+    lines.push('lastLocalOfferSdp: ' + (lastLocalOfferSdp ? lastLocalOfferSdp.slice(0,60).replace(/\n/g,'') + '...' : 'none'));
+    debugPanel.innerText = lines.join('\n');
+  }, 500);
+
   // 1. Set up the media source for the local webcam
   if (webcamButton) {
     webcamButton.onclick = async () => {
       localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-      remoteStream = new MediaStream();
 
       // Push tracks from local stream user to peer connection. If transceivers exist, replaceTrack
       try {
@@ -194,15 +304,40 @@ window.addEventListener('DOMContentLoaded', () => {
 
       if (callInput) callInput.value = callDoc.id;
 
-      // Get candidates for caller, save to db
+      // Batch candidate writes to Firestore to reduce write rate (helps avoid quota/exhaustion)
+      let offerCandidateQueue = [];
+      let offerFlushTimer = null;
+      function scheduleOfferFlush() {
+        if (offerFlushTimer) return;
+        offerFlushTimer = setTimeout(async () => {
+          const items = offerCandidateQueue.splice(0);
+          offerFlushTimer = null;
+          for (const c of items) {
+            try {
+              await offerCandidates.add(c);
+            } catch (err) {
+              console.error('[signaling] offerCandidates.add failed', err);
+              const statusEl = document.getElementById('status'); if (statusEl) statusEl.textContent = 'Firestore write error: ' + (err.message || err);
+            }
+          }
+        }, 300);
+      }
+
       pc.onicecandidate = event => {
         if (event.candidate) {
-          offerCandidates.add(event.candidate.toJSON()).catch(e => console.error('offerCandidates.add failed', e));
+          try {
+            offerCandidateQueue.push(event.candidate.toJSON());
+            scheduleOfferFlush();
+          } catch (e) {
+            console.error('[signaling] failed enqueue offer candidate', e);
+          }
         }
       };
 
-      // Create offer
-      const offerDescription = await pc.createOffer();
+  // Ensure local media is active and attached before creating the offer
+  try { await ensureLocalStream(); } catch (e) { alert('Unable to access webcam: ' + (e.message || e)); return; }
+  // Create offer
+  const offerDescription = await pc.createOffer();
       await pc.setLocalDescription(offerDescription);
 
       const offer = {
@@ -212,28 +347,59 @@ window.addEventListener('DOMContentLoaded', () => {
 
       // Save it to the database under the `offer` key
       await callDoc.set({ offer });
+  { const s = document.getElementById('status'); if (s) s.textContent = 'Offer published'; }
+      // mark signaling state
+      currentCallDoc = callDoc;
+      currentRole = 'caller';
+      lastLocalOfferSdp = offer.sdp;
       console.debug('[signaling] offer saved, id=', callDoc.id);
-
-      // Listen to changes as remote answer
-      callDoc.onSnapshot((snapshot) => {
+  // Listen to changes as remote answer/offer for renegotiation
+  callDocUnsub = callDoc.onSnapshot(async (snapshot) => {
         const data = snapshot.data();
+        if (!data) return;
+
+        // If an answer appears and we haven't applied it yet, set remote description
         if (!remoteDescriptionSet && data?.answer) {
-          const answerDescription = new RTCSessionDescription(data.answer);
-          pc.setRemoteDescription(answerDescription)
-            .then(() => {
-              console.debug('[signaling] setRemoteDescription(answer) success');
-              remoteDescriptionSet = true;
-              flushPendingCandidates();
-            })
-            .catch(err => console.error('[signaling] setRemoteDescription(answer) failed', err));
+          try {
+            const answerDescription = new RTCSessionDescription(data.answer);
+            await pc.setRemoteDescription(answerDescription);
+            console.debug('[signaling] setRemoteDescription(answer) success');
+            remoteDescriptionSet = true;
+            await flushPendingCandidates();
+            console.debug('[pc] receivers after setRemoteDescription (caller):', pc.getReceivers().map(r => r.track && r.track.kind));
+            console.debug('[pc] transceivers after setRemoteDescription (caller):', pc.getTransceivers().map(t => ({ mid: t.mid, direction: t.direction })));
+            { const s = document.getElementById('status'); if (s) s.textContent = 'Answer applied (caller)'; }
+          } catch (err) {
+            console.error('[signaling] setRemoteDescription(answer) failed', err);
+          }
+        }
+
+        // If an offer appears that is not our last local offer, treat it as a re-offer and answer it
+        if (data?.offer && data.offer.sdp && data.offer.sdp !== lastLocalOfferSdp) {
+          // Avoid reacting to our own offer
+          try {
+            console.debug('[signaling] remote offer detected (renegotiation)');
+            await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+            remoteDescriptionSet = true;
+            await flushPendingCandidates();
+
+            const answerDescription = await pc.createAnswer();
+            await pc.setLocalDescription(answerDescription);
+            const answer = { sdp: answerDescription.sdp, type: answerDescription.type };
+            await callDoc.update({ answer });
+            console.debug('[signaling] answered remote re-offer');
+          } catch (err) {
+            console.error('[signaling] handling remote offer failed', err);
+          }
         }
       });
 
-      // Listen for ICE candidates from the answering user
-      answerCandidates.onSnapshot((snapshot) => {
+  // Listen for ICE candidates from the answering user
+  answerCandidatesUnsub = answerCandidates.onSnapshot((snapshot) => {
         snapshot.docChanges().forEach((change) => {
           if (change.type === "added") {
             const data = change.doc.data();
+            console.debug('[signaling] answerCandidates snapshot added', data.sdpMid, data.sdpMLineIndex);
             const candidate = new RTCIceCandidate(data);
             if (remoteDescriptionSet) {
               pc.addIceCandidate(candidate).catch(e => console.error('addIceCandidate failed', e));
@@ -244,6 +410,8 @@ window.addEventListener('DOMContentLoaded', () => {
           }
         });
       });
+  // ensure we clear any timers when hangup happens by storing them on callDoc
+  callDoc._offerFlushTimer = () => { if (offerFlushTimer) { clearTimeout(offerFlushTimer); offerFlushTimer = null; } };
     };
   }
 
@@ -292,40 +460,111 @@ window.addEventListener('DOMContentLoaded', () => {
       };
 
       pc.ontrack = (event) => {
-        console.debug('[pc] ontrack', event);
-        if (!remoteStream) remoteStream = new MediaStream();
+        console.debug('[pc] ontrack (recreated)', event);
         if (event.streams && event.streams[0]) {
-          event.streams[0].getTracks().forEach((t) => remoteStream.addTrack(t));
-        } else if (event.track) {
-          remoteStream.addTrack(event.track);
+          console.debug('[pc] ontrack (recreated): using event.streams[0]');
+          remoteStream = event.streams[0];
+          if (remoteVideoStream) remoteVideoStream.srcObject = remoteStream;
+          return;
         }
+        if (!remoteStream) remoteStream = new MediaStream();
+        if (event.track) remoteStream.addTrack(event.track);
         if (remoteVideoStream) remoteVideoStream.srcObject = remoteStream;
       };
 
       pc.onconnectionstatechange = () => console.debug('[pc] connectionState:', pc.connectionState);
       pc.oniceconnectionstatechange = () => console.debug('[pc] iceConnectionState:', pc.iceConnectionState);
+  // Unsubscribe any Firestore listeners from previous session
+  try { if (callDocUnsub) { callDocUnsub(); callDocUnsub = null; } } catch (e) { console.warn('callDocUnsub failed', e); }
+  try { if (offerCandidatesUnsub) { offerCandidatesUnsub(); offerCandidatesUnsub = null; } } catch (e) { console.warn('offerCandidatesUnsub failed', e); }
+  try { if (answerCandidatesUnsub) { answerCandidatesUnsub(); answerCandidatesUnsub = null; } } catch (e) { console.warn('answerCandidatesUnsub failed', e); }
+  // If the active callDoc stored flush timer cleanup hooks, call them
+  try { if (currentCallDoc && typeof currentCallDoc._offerFlushTimer === 'function') { currentCallDoc._offerFlushTimer(); } } catch (e) { console.warn('callDoc._offerFlushTimer failed', e); }
+  try { if (currentCallDoc && typeof currentCallDoc._answerFlushTimer === 'function') { currentCallDoc._answerFlushTimer(); } } catch (e) { console.warn('callDoc._answerFlushTimer failed', e); }
+  currentCallDoc = null;
     };
   }
 
   // 3. Create an answer
   if (answerButton) {
     answerButton.onclick = async () => {
-      const callId = callInput.value;
+      // Validate callId early and trim
+      const rawCallId = callInput.value && callInput.value.trim();
+      if (!rawCallId) {
+        alert('Please enter a Call ID to answer.');
+        return;
+      }
+      const callId = rawCallId;
       const callDoc = firestore.collection('calls').doc(callId);
       const offerCandidates = callDoc.collection('offerCandidates');
       const answerCandidates = callDoc.collection('answerCandidates');
 
       // Listen to ICE candidate on the peer connection to update the answer candidates collection
+      // Batch candidate writes on the answer side as well
+      let answerCandidateQueue = [];
+      let answerFlushTimer = null;
+      function scheduleAnswerFlush() {
+        if (answerFlushTimer) return;
+        answerFlushTimer = setTimeout(async () => {
+          const items = answerCandidateQueue.splice(0);
+          answerFlushTimer = null;
+          for (const c of items) {
+            try {
+              await answerCandidates.add(c);
+            } catch (err) {
+              console.error('[signaling] answerCandidates.add failed', err);
+              const statusEl = document.getElementById('status'); if (statusEl) statusEl.textContent = 'Firestore write error: ' + (err.message || err);
+            }
+          }
+        }, 300);
+      }
+
       pc.onicecandidate = event => {
         if (event.candidate) {
-          answerCandidates.add(event.candidate.toJSON()).catch(e => console.error('answerCandidates.add failed', e));
+          try {
+            answerCandidateQueue.push(event.candidate.toJSON());
+            scheduleAnswerFlush();
+          } catch (e) {
+            console.error('[signaling] failed enqueue answer candidate', e);
+          }
         }
       };
+      // expose a cleanup hook for the hangup logic
+      callDoc._answerFlushTimer = () => { if (answerFlushTimer) { clearTimeout(answerFlushTimer); answerFlushTimer = null; } };
+
+      // IMPORTANT: attach offerCandidates listener immediately so we don't miss caller ICE candidates
+      // Buffer them until we set the remote description.
+      offerCandidatesUnsub = offerCandidates.onSnapshot((snapshot) => {
+        snapshot.docChanges().forEach((change) => {
+          if (change.type === 'added') {
+            const data = change.doc.data();
+            const candidate = new RTCIceCandidate(data);
+            if (remoteDescriptionSet) {
+              pc.addIceCandidate(candidate).catch(e => console.error('addIceCandidate failed', e));
+            } else {
+              console.debug('[signaling] buffering offer candidate until remote description is set', data);
+              bufferCandidate(candidate);
+            }
+          }
+        });
+      });
 
       // Fetch call document from the database, and grab its data
       console.debug('[signaling] answer flow: navigator.onLine=', navigator.onLine);
       const statusEl = document.getElementById('status');
       function setStatus(msg) { console.debug('[ui] status', msg); if (statusEl) statusEl.textContent = msg; }
+
+  // Ensure auth is ready (anonymous sign-in finished) before reading Firestore
+      if (!auth.currentUser) {
+        setStatus('Waiting for auth...');
+        await new Promise((resolve) => {
+          const unsubAuth = auth.onAuthStateChanged((u) => {
+            try { unsubAuth(); } catch (e) {}
+            resolve();
+          });
+        });
+        console.debug('[auth] auth ready', auth.currentUser && auth.currentUser.uid);
+      }
 
       let callData;
       const maxAttempts = 3;
@@ -333,8 +572,17 @@ window.addEventListener('DOMContentLoaded', () => {
         try {
           setStatus(`Fetching call document (attempt ${attempt}/${maxAttempts})...`);
           const snap = await callDoc.get();
-          callData = snap.data();
-          break;
+          console.debug('[signaling] callDoc.get snap.exists=', snap.exists, 'id=', callDoc.id, 'keys=', snap.exists ? Object.keys(snap.data()) : []);
+          if (snap.exists) {
+            callData = snap.data();
+            setStatus('Fetched call document');
+            break;
+          } else {
+            // Document not found yet — wait and retry
+            setStatus(`Call document not found (attempt ${attempt}). Retrying...`);
+            await new Promise(res => setTimeout(res, 500 * Math.pow(2, attempt - 1)));
+            continue;
+          }
         } catch (err) {
           console.error('[signaling] callDoc.get failed', err);
           setStatus(`callDoc.get failed (attempt ${attempt}) - ${err?.message || err}`);
@@ -353,23 +601,37 @@ window.addEventListener('DOMContentLoaded', () => {
       }
 
       if (!callData) {
-        setStatus('Failed to fetch call document after multiple attempts. Check network / Firebase.');
-        alert('Failed to fetch call document: offline or network error. Check your internet connection and Firebase configuration.');
+        setStatus('Failed to fetch call document after multiple attempts. Check network / Firebase / Call ID.');
+        alert('Failed to fetch call document: offline or network error or call not found. Check your internet connection, Firebase configuration and that the Call ID is correct.');
         return;
       }
-      if (!callData || !callData.offer) {
-        console.error('Call document missing or no offer found');
+      if (!callData.offer) {
+        console.error('Call document missing offer field');
+        setStatus('Call document exists but missing offer.');
         return;
       }
+
+  // mark signaling state
+  currentCallDoc = callDoc;
+  currentRole = 'answerer';
+  // reset lastLocalOfferSdp so we can respond to existing offers
+  lastLocalOfferSdp = null;
 
       const offerDescription = callData.offer;
       await pc.setRemoteDescription(new RTCSessionDescription(offerDescription)); // Set remote description on the peer connection
+  console.debug('[signaling] answer flow: setRemoteDescription(offer) complete');
+  console.debug('[pc] transceivers after setRemoteDescription:', pc.getTransceivers().map(t => ({ mid: t.mid, direction: t.direction, senderTracks: t.sender && t.sender.track && t.sender.track.kind })));
+  console.debug('[pc] receivers after setRemoteDescription:', pc.getReceivers().map(r => r.track && r.track.kind));
       remoteDescriptionSet = true;
       await flushPendingCandidates();
 
-      // Create an answer from the peer connection and set the current local description
-      const answerDescription = await pc.createAnswer();
+  // Ensure local media is active and attached before creating the answer
+  try { await ensureLocalStream(); } catch (e) { alert('Unable to access webcam: ' + (e.message || e)); return; }
+  // Create an answer from the peer connection and set the current local description
+  const answerDescription = await pc.createAnswer();
       await pc.setLocalDescription(answerDescription);
+  console.debug('[signaling] answer flow: setLocalDescription(answer) complete');
+  console.debug('[pc] senders after setLocalDescription (answerer):', pc.getSenders().map(s => ({ id: s.track && s.track.id, kind: s.track && s.track.kind })));
 
       // Convert the Session Description Protocol (SDP) data info to a plain JS object
       const answer = {
@@ -379,22 +641,51 @@ window.addEventListener('DOMContentLoaded', () => {
 
       // Update on the call document so that the other user can listen to the answer
       await callDoc.update({ answer });
+  { const s = document.getElementById('status'); if (s) s.textContent = 'Answer published (answerer)'; }
 
-      // Set up a listener on the offer candidates collection and add them safely
-      offerCandidates.onSnapshot((snapshot) => {
-        snapshot.docChanges().forEach((change) => {
-          if (change.type === 'added') {
-            const data = change.doc.data();
-            const candidate = new RTCIceCandidate(data);
-            if (remoteDescriptionSet) {
-              pc.addIceCandidate(candidate).catch(e => console.error('addIceCandidate failed', e));
-            } else {
-              console.debug('[signaling] buffering offer candidate until remote description is set', data);
-              bufferCandidate(candidate);
-            }
+      // Listen to changes on the call doc so we can respond to re-offers (answerer side)
+      callDocUnsub = callDoc.onSnapshot(async (snapshot) => {
+        const data = snapshot.data();
+        if (!data) return;
+
+        // If a new offer appears that's not our last local offer, it's a re-offer
+        if (data?.offer && data.offer.sdp && data.offer.sdp !== lastLocalOfferSdp) {
+          try {
+            console.debug('[signaling] answerer detected remote offer (renegotiation) via callDoc snapshot');
+            await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+            remoteDescriptionSet = true;
+            await flushPendingCandidates();
+
+            const answerDescription2 = await pc.createAnswer();
+            await pc.setLocalDescription(answerDescription2);
+            const answer2 = { sdp: answerDescription2.sdp, type: answerDescription2.type };
+            await callDoc.update({ answer: answer2 });
+            console.debug('[signaling] answerer replied to re-offer (callDoc snapshot)');
+          } catch (err) {
+            console.error('[signaling] answerer failed handling remote offer (callDoc snapshot)', err);
           }
-        });
+        }
       });
+
+      // Ensure we only attach the offerCandidates listener once; if not attached yet, save the unsub handle
+      if (!offerCandidatesUnsub) {
+        offerCandidatesUnsub = offerCandidates.onSnapshot((snapshot) => {
+          snapshot.docChanges().forEach((change) => {
+            if (change.type === 'added') {
+              const data = change.doc.data();
+              const candidate = new RTCIceCandidate(data);
+              if (remoteDescriptionSet) {
+                pc.addIceCandidate(candidate).catch(e => console.error('addIceCandidate failed', e));
+              } else {
+                console.debug('[signaling] buffering offer candidate until remote description is set', data);
+                bufferCandidate(candidate);
+              }
+            }
+          });
+        });
+      } else {
+        console.debug('[signaling] offerCandidates listener already attached');
+      }
     };
   }
 });
