@@ -96,7 +96,7 @@ ngrok http 5173
 
 This is how it should look like from the sender side:
 
-![App image](./peer-1-local.png)
+![App image](./2p-local-and-remote.png)
 
 Confirm the `hosting.public` path in `firebase.json` matches the frontend build output (usually `dist`).
 
