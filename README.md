@@ -104,7 +104,7 @@ Confirm the `hosting.public` path in `firebase.json` matches the frontend build 
 
 You can find a demo of a call here too:
 
-[![Demo]](./2p-call-demo.mp4)
+https://raw.githubusercontent.com/jackiefasty/my-video-chat/main/2p-call-demo.mp4
 
 ## Contributing
 Bug reports, improvements and PRs are welcome. Keep changes small and focused.
