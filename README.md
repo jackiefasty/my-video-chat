@@ -104,7 +104,7 @@ Confirm the `hosting.public` path in `firebase.json` matches the frontend build 
 
 You can find a demo of a call here too:
 
-![App video](./2p-call-demo.mov)
+[![Demo](./2p-local-and-remote.png)](./2p-call-demo.mp4)
 
 ## Contributing
 Bug reports, improvements and PRs are welcome. Keep changes small and focused.
