@@ -83,22 +83,28 @@ firebase deploy
 ```bash
 cd /Users/borjajavierre/my-video-chat/app/my-video-chat-tool 
 npm install
-npm run dev -- --host 0.0.0.0 --port 5173
+npm run dev -- --host 0.0.0.0 --port 5174
 curl -v http://localhost:5173/ 
 ```
 
-and eventually run
+and eventually run 
 
 ```
 ngrok http 5173
 
 ```
 
+The local peer can connect using ```http://localhost:5174``` and the remote peer using ```https://kneelingly-unblazoned-holley.ngrok-free.dev``` (onece ngrok is correctly initialized)
+
 This is how it should look like from the sender side:
 
 ![App image](./2p-local-and-remote.png)
 
 Confirm the `hosting.public` path in `firebase.json` matches the frontend build output (usually `dist`).
+
+You can find a demo of a call here too:
+
+![App video](./2p-call-demo.mov)
 
 ## Contributing
 Bug reports, improvements and PRs are welcome. Keep changes small and focused.
